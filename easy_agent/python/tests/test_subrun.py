@@ -1,0 +1,186 @@
+"""Multi-agent: a sub-agent is a child Run recursively driven by some body, using the very same kernel."""
+
+import asyncio
+
+from src.kernel import (
+    FnBody,
+    Node,
+    Outcome,
+    Plan,
+    RunState,
+    Scheduler,
+    SubPlanBody,
+    ToolCall,
+    append,
+)
+from src.runtime.agent import Agent
+from src.runtime.llm import ScriptedLlm
+
+_TASK_SCHEMA = {
+    "type": "object",
+    "properties": {"task": {"type": "string"}},
+    "required": ["task"],
+}
+
+
+def child_plan():
+    c = Plan(channels={"trace": append()})
+    c.add(Node("work", FnBody(lambda x, ctx: Outcome.ok("child-result", trace=[x])), terminal=True))
+    return c
+
+
+async def test_subrun_call_returns_output_to_parent():
+    parent = Plan()
+    parent.add(Node("delegate", SubPlanBody(child_plan()), terminal=True))
+    sch = Scheduler()
+    started = []
+    sch.bus.on("run_started", lambda evt: started.append(evt))
+    run = await sch.run(parent, task="给子Agent的任务")
+    assert run.state == RunState.COMPLETED
+    # call semantics: by default only the child Run's final output is handed back to the parent node.
+    assert run.final_output == "child-result"
+    # the child Run's run_started event carries parent_id, so the Run tree can be rebuilt.
+    child_starts = [e for e in started if e.parent_id == run.run_id]
+    assert len(child_starts) == 1
+
+
+async def test_nested_subruns_build_a_run_tree():
+    # grandparent -> parent (body is a child Run) -> child, only output flows back up each level.
+    grandchild = child_plan()
+    middle = Plan()
+    middle.add(Node("m", SubPlanBody(grandchild), terminal=True))
+    root = Plan()
+    root.add(Node("r", SubPlanBody(middle), terminal=True))
+    run = await Scheduler().run(root, task="deep")
+    assert run.state == RunState.COMPLETED
+    assert run.final_output == "child-result"
+
+
+async def test_mutual_delegation_loop_is_capped():
+    # A activates B and B activates A: without a depth guard this recurses
+    # forever, so it must fail at the Run-tree depth limit (enforced at birth).
+    plan_a, plan_b = Plan(), Plan()
+    plan_a.add(Node("a", SubPlanBody(plan_b), terminal=True))
+    plan_b.add(Node("b", SubPlanBody(plan_a), terminal=True))
+    run = await Scheduler().run(plan_a, task="mutual delegation")
+    assert run.state == RunState.FAILED
+    assert "depth" in str(run.final_output)
+
+
+async def test_mutual_sub_agents_loop_fails_at_depth_limit():
+    # Mutual sub-agents run on one shared Scheduler, so each hop deepens the same
+    # Run tree and the cycle must meet the structural depth guard (not loop forever).
+    a = Agent("a", model=ScriptedLlm([ToolCall("b", {"task": "again"})] * 20), instruction="a")
+    b = Agent(
+        "b",
+        model=ScriptedLlm([ToolCall("a", {"task": "again"})] * 20),
+        instruction="b",
+        sub_agents=[a],
+    )
+    a.add_sub_agent(b)  # wire the back-reference a constructor cannot express
+    result = await a.run("start")
+    assert "failed" in result.status
+    assert "circular delegation" in str(result.output)
+
+
+class _ExplodingModel:
+    async def chat(self, messages, *, tools=None, system=None, on_delta=None):
+        raise RuntimeError("model backend exploded")
+
+
+async def test_sub_agents_child_failure_propagates():
+    # A failed child Run must not come back as a normal tool result: failure
+    # propagates up the tree, exactly as with ctx.spawn.
+    child = Agent("child", model=_ExplodingModel(), instruction="child")
+    parent = Agent(
+        "parent",
+        model=ScriptedLlm([ToolCall("child", {"task": "do it"}), "done anyway"]),
+        instruction="parent",
+        sub_agents=[child],
+    )
+    result = await parent.run("start")
+    assert "failed" in result.status
+    assert "model backend exploded" in str(result.output)
+
+
+async def test_sibling_delegations_do_not_accumulate_depth():
+    # Two delegations from one run both sit at depth 1; sequential or same-turn
+    # siblings must not add up.
+    one = Agent("one", model=ScriptedLlm(["one done"]), instruction="one")
+    two = Agent("two", model=ScriptedLlm(["two done"]), instruction="two")
+    boss = Agent(
+        "boss",
+        model=ScriptedLlm(
+            [[ToolCall("one", {"task": "x"}), ToolCall("two", {"task": "y"})], "both done"]
+        ),
+        instruction="boss",
+        sub_agents=[one, two],
+    )
+    result = await boss.run("go")
+    assert "completed" in result.status
+    tool_outputs = [m.get("content") for m in result.messages if m.get("role") == "tool"]
+    assert "one done" in tool_outputs and "two done" in tool_outputs
+
+
+async def test_same_turn_tool_calls_run_concurrently_and_keep_order():
+    # ping can only finish after pong has started: sequential execution would
+    # deadlock it into the timeout; concurrent execution completes. Results
+    # still land in call order even though pong finishes first.
+    started = asyncio.Event()
+
+    async def ping(task, ctx=None):
+        try:
+            await asyncio.wait_for(started.wait(), 2)
+        except TimeoutError:
+            return "DEADLOCK"
+        return "ping done"
+
+    async def pong(task, ctx=None):
+        started.set()
+        await asyncio.sleep(0.01)
+        return "pong done"
+
+    boss = Agent(
+        "boss",
+        model=ScriptedLlm(
+            [[ToolCall("ping", {"task": "x"}), ToolCall("pong", {"task": "y"})], "fin"]
+        ),
+        instruction="boss",
+        tools=[ping, pong],
+    )
+    result = await boss.run("go")
+    assert "completed" in result.status
+    outs = [m["content"] for m in result.messages if m.get("role") == "tool"]
+    assert outs == ["ping done", "pong done"]
+
+
+async def test_a_fresh_run_starts_at_depth_zero():
+    # running a definition hosts a fresh depth-0 root on its own Scheduler.
+    solo = Agent("solo", model=ScriptedLlm(["solo output"]), instruction="solo")
+    result = await solo.run("anything")
+    assert result.output == "solo output"
+
+
+async def test_run_name_is_blueprint_identity_not_state():
+    child = Plan(name="child-expert", channels={"trace": append()})
+    child.add(
+        Node("work", FnBody(lambda x, ctx: Outcome.ok("child-result", trace=[x])), terminal=True)
+    )
+    parent = Plan()
+    parent.add(Node("delegate", SubPlanBody(child), terminal=True))
+    sch = Scheduler()
+    started = []
+    sch.bus.on("run_started", lambda evt: started.append(evt))
+
+    run = await sch.run(parent, task="给子Agent的任务")
+
+    # Both spawn paths (SubPlanBody here, Agent delegation in the facade)
+    # create Runs whose name derives from the plan — no per-run assignment.
+    names = [e.data.get("name") for e in started]
+    assert "child-expert" in names and "" in names  # the anonymous parent stays nameless
+    assert run.name == ""
+    # Static identity is never run state: it derives from the blueprint, and a
+    # replay of the same stream keeps deriving it (the plan is at hand).
+    from src.kernel import replay
+
+    assert replay(parent, await sch.eventlog.events(run.run_id)).name == ""

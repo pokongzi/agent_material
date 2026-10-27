@@ -1,0 +1,87 @@
+"""Strategy-layer tests: memory, skills, MCP normalization, backpressure, file-log resume."""
+
+from src.backends.file_store import FileEventLog
+from src.kernel import (
+    Bus,
+    FnBody,
+    Node,
+    Outcome,
+    Plan,
+    Scheduler,
+    ToolCall,
+)
+from src.runtime.mcp import InProcessMCPServer, load_mcp_tools
+from src.runtime.memory import InMemoryMemory
+from src.runtime.skills import Skill, SkillRegistry
+from src.runtime.tools import ToolRegistry
+
+
+async def test_memory_remember_and_recall():
+    mem = InMemoryMemory()
+    await mem.remember("用户对芒果过敏", tags=["偏好"])
+    await mem.remember("订单 123 已发货", tags=["订单"])
+    text = await mem.recall("我对什么过敏？")
+    assert "芒果" in text
+
+
+async def test_skill_match_and_apply():
+    reg = SkillRegistry()
+    reg.register(Skill("退款流程", "处理退款退货售后", instructions="先核验订单再退款"))
+    skill = reg.match("这个客户要退款")
+    assert skill and skill.name == "退款流程"
+    system = reg.apply_to_system(skill, "你是客服")
+    assert "先核验订单" in system
+
+
+async def test_mcp_tools_share_same_pipeline():
+    server = InProcessMCPServer("demo")
+    server.define(
+        "echo",
+        lambda args: args["x"],
+        description="回显",
+        parameters={"type": "object", "properties": {"x": {"type": "integer"}}},
+    )
+    reg = ToolRegistry()
+    names = await load_mcp_tools(reg, server)
+    assert names == ["echo"]
+    result = await reg.dispatch(ToolCall("echo", {"x": 42}))
+    assert (
+        result.ok and result.output == 42
+    )  # MCP tools go through the same path as local functions
+
+
+async def test_bus_backpressure_drop():
+    bus = Bus()
+    sub = bus.subscribe("tick", maxsize=1, on_full="drop")
+    for i in range(5):
+        await bus.fire(
+            "tick", i=i
+        )  # nobody consumes; once the queue is full, frames drop without blocking
+    assert sub.dropped == 4
+    first = await sub.get()
+    assert first["i"] == 0
+
+
+async def test_file_store_resume_across_schedulers(tmp_path):
+    # simulates a process restart: two Scheduler instances share one .jsonl
+    # event log — the only durable thing — and continue after suspending.
+    def build():
+        p = Plan()
+
+        def approve(_x, ctx):
+            if ctx.resume_value is None:
+                return Outcome.park("approval", question="确认？")
+            return Outcome.ok(ctx.resume_value)
+
+        p.add(Node("approve", FnBody(approve), terminal=True))
+        return p
+
+    log = FileEventLog(str(tmp_path))
+    sch1 = Scheduler(eventlog=log)
+    run = await sch1.run(build())
+    assert str(run.state) == "suspended"
+
+    sch2 = Scheduler(eventlog=log)
+    run2 = await sch2.resume(build(), run.run_id, {"ok": True})
+    assert str(run2.state) == "completed"
+    assert run2.final_output == {"ok": True}

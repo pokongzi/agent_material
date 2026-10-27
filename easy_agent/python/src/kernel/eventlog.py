@@ -1,0 +1,109 @@
+"""eventlog — events are the source of truth; state is a projection folded
+from the event stream.
+
+Three pieces:
+- Event: an immutable "fact that happened", append-only, never modified;
+- apply_event: a pure function that folds one event into shared state —
+  replaying the stream rebuilds state;
+- EventLog storage protocol plus the in-process default; in production swap in
+  Redis/Postgres. There is deliberately no snapshot store beside it: the
+  stream alone rebuilds every Run (see replay), so a cache would be a second
+  truth, not a speedup the kernel owes anyone.
+
+Why fold state from events instead of storing one latest dict? Because the
+event stream gives you audit (how we got here), time travel (back to any
+step), and crash recovery (just replay) all at once.
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field
+from typing import Any, Protocol
+
+from src.kernel.channels import Channel
+
+# Event kinds (the teaching build keeps just the most telling ones;
+# production can be finer-grained).
+RUN_STARTED = "run_started"
+NODE_STARTED = "node_started"
+NODE_COMPLETED = "node_completed"
+NODE_FAILED = "node_failed"
+NODE_SKIPPED = "node_skipped"
+NODE_RETRY = "node_retry"
+STATE_DELTA = "state_delta"
+# a fact, not state: a node spawned a child Run (the crash-reattach anchor)
+DELEGATED = "delegated"
+# A control command that actually happened: data = {"op": "goto"|"send", ...}.
+# Commands express intent; once applied they are recorded as this fact, so the
+# stream alone — not the live scheduler — can rebuild where control went.
+CONTROL = "control"
+# A produced file: the bytes live in a BlobStore, this event is only the
+# pointer (filename/version/uri/mime/size). The artifact library is a fold of
+# these pointer events — the same law as state: facts in the stream, views projected.
+ARTIFACT_WRITTEN = "artifact_written"
+INTERRUPTED = "interrupted"
+RESUMED = "resumed"
+RUN_COMPLETED = "run_completed"
+RUN_FAILED = "run_failed"
+
+
+@dataclass(frozen=True)
+class Event:
+    seq: int  # monotonically increasing within a run
+    run_id: str
+    kind: str
+    data: dict[str, Any] = field(default_factory=dict)
+    parent_id: str | None = None  # child-Run events attach to the parent to rebuild the Run tree
+    ts: float = field(
+        default_factory=time.monotonic
+    )  # wall of record; the trace derives durations by subtraction
+
+
+def apply_event(shared: dict[str, Any], event: Event, channels: dict[str, Channel]) -> None:
+    """Fold a single event into ``shared`` (in place). Pure: the same event
+    stream always yields the same state."""
+    if event.kind != STATE_DELTA:
+        return
+    for key, value in event.data.get("delta", {}).items():
+        channel = channels[key]
+        shared[key] = channel.reducer(shared.get(key), value)
+
+
+def fold_events(
+    events: list[Event], channels: dict[str, Channel], initial: dict[str, Any]
+) -> dict[str, Any]:
+    """Replay a whole event stream from an initial state (tests, time travel)."""
+    shared = dict(initial)
+    for ev in events:
+        apply_event(shared, ev, channels)
+    return shared
+
+
+class EventLog(Protocol):
+    async def append(self, event: Event) -> None: ...
+    async def events(self, run_id: str) -> list[Event]: ...
+    async def all_events(self) -> list[Event]:
+        """Every Run's facts — the source for a cross-Run trace projection."""
+        ...
+
+
+class InMemoryEventLog:
+    """In-process event log, the default implementation; its interface is the
+    contract a production backend must satisfy."""
+
+    def __init__(self) -> None:
+        self._streams: dict[str, list[Event]] = {}
+
+    async def append(self, event: Event) -> None:
+        stream = self._streams.setdefault(event.run_id, [])
+        stream.append(event)
+
+    async def events(self, run_id: str) -> list[Event]:
+        return list(self._streams.get(run_id, ()))
+
+    async def all_events(self) -> list[Event]:
+        out: list[Event] = []
+        for stream in self._streams.values():
+            out.extend(stream)
+        return out

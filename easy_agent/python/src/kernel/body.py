@@ -1,0 +1,399 @@
+"""body — the single composable interface, plus four built-in bodies.
+
+In the kernel's eyes there is only one kind of "schedulable thing": an
+executable that satisfies the NodeBody protocol, takes input and a
+NodeContext, and returns an Outcome. So:
+
+- a plain function (FnBody) is a body;
+- one governed tool call (ToolBody) is a body;
+- one fixed-prompt model call (LLMBody) is a body;
+- activating a sub-agent / sub-plan (SubPlanBody) is also a body.
+
+There is no separate "macro node vs micro agent" vocabulary, only bodies
+nested inside bodies — multi-agent is simply some body recursively running
+another graph.
+
+An Outcome is what a body produces, split orthogonally into:
+- value: a value for downstream nodes;
+- state_delta: data folded into shared state via reducers;
+- control: a Goto/Send command (None = follow static edges naturally);
+- suspend: when set, request to be released and suspended at this point.
+"""
+
+from __future__ import annotations
+
+import inspect
+from dataclasses import dataclass, field
+from typing import Any, Protocol, runtime_checkable
+
+from src.kernel.blob import resolve_artifact
+from src.kernel.command import Command, Goto, Send
+from src.kernel.eventlog import ARTIFACT_WRITTEN
+from src.kernel.run import Interrupt
+from src.kernel.types import RunState, ToolCall
+
+
+@dataclass(frozen=True)
+class Outcome:
+    value: Any = None
+    state_delta: dict[str, Any] = field(default_factory=dict)
+    # control can be one command or a group of them (fan out several Sends).
+    control: Command | list[Command] | None = None
+    suspend: Interrupt | None = None
+
+    # — convenient constructors that read like "stating intent" —
+    @classmethod
+    def ok(cls, value: Any = None, **delta: Any) -> Outcome:
+        return cls(value=value, state_delta=dict(delta))
+
+    @classmethod
+    def goto(
+        cls, target: str, payload: Any = None, *, immediate: bool = True, **delta: Any
+    ) -> Outcome:
+        """Transition to target; payload is its next input, delta folds into state."""
+        return cls(state_delta=dict(delta), control=Goto(target, immediate, payload))
+
+    @classmethod
+    def send(cls, template: str, payload: Any, key: str | None = None) -> Outcome:
+        return cls(control=Send(template, payload, key))
+
+    @classmethod
+    def park(cls, kind: str, payload: Any = None, question: str = "") -> Outcome:
+        return cls(suspend=Interrupt(kind, payload, question))
+
+
+def coerce_outcome(raw: Any) -> Outcome:
+    """Let a body be terse: a bare value/dict/command/group is normalized into
+    an Outcome automatically."""
+    if raw is None:
+        return Outcome()
+    if isinstance(raw, Outcome):
+        return raw
+    if isinstance(raw, Command):
+        return Outcome(control=raw)
+    if isinstance(raw, list):
+        # Treat it as a control group only when the whole group is control
+        # intent (commands/Outcomes), e.g. fanning out several Sends. An ordinary
+        # list (such as sorted results) stays a business value — being a list
+        # alone must not make us guess it is a command, or returning lists in
+        # business logic would be misread.
+        if raw and all(isinstance(x, (Command, Outcome)) for x in raw):
+            controls: list = []
+            delta: dict = {}
+            for item in raw:
+                oc = coerce_outcome(item)
+                if oc.control is not None:
+                    controls.extend(oc.control if isinstance(oc.control, list) else [oc.control])
+                delta.update(oc.state_delta)
+            return Outcome(state_delta=delta, control=controls or None)
+        return Outcome(value=raw)
+    if isinstance(raw, dict):
+        # A bare dict folds into state; return Outcome.ok(d) when the dict itself is the value.
+        return Outcome(state_delta=raw)
+    return Outcome(value=raw)
+
+
+@runtime_checkable
+class NodeBody(Protocol):
+    async def run(self, input: Any, ctx: NodeContext) -> Outcome: ...
+
+
+class NodeContext:
+    """The "service wiring" a body can use while running.
+
+    Note this is wiring, not data: it holds live objects like the model port
+    and tool port, so it never becomes a fact. A run's data travels via
+    input / state_delta and is never smuggled into context — that boundary keeps
+    the event stream clean.
+    """
+
+    def __init__(
+        self,
+        run: Any,
+        node_id: str,
+        *,
+        llm: Any = None,
+        tools: Any = None,
+        subagent: Any = None,
+        bus: Any = None,
+        blobs: Any = None,
+        record: Any = None,
+        facts: Any = None,
+        resume_value: Any = None,
+    ):
+        self.run = run
+        self.node_id = node_id
+        self._llm = llm
+        self._tools = tools
+        self._subagent = subagent
+        self._bus = bus
+        self._blobs = blobs
+        # The ledger's write/read pair, injected by the scheduler so a body can
+        # speak to the log without holding it: record(kind, data) appends one
+        # durable fact; facts() reads this run's facts back, oldest first.
+        self._record = record
+        self._facts = facts
+        self.resume_value = resume_value
+
+    @property
+    def shared(self) -> dict[str, Any]:
+        """Read-only view of shared state; to change state return state_delta and
+        let the engine fold it at the barrier."""
+        return self.run.shared
+
+    @property
+    def run_id(self) -> str:
+        return self.run.run_id
+
+    @property
+    def bus(self):
+        """The host scheduler's bus (read-only wiring). Runtime helpers use it
+        to bind a spawned registry's approval gate onto the host bus."""
+        return self._bus
+
+    async def emit(self, event: str, **data: Any) -> None:
+        if self._bus is not None:
+            await self._bus.fire(event, run_id=self.run_id, node_id=self.node_id, **data)
+
+    async def llm_complete(self, prompt: str, system: str | None = None) -> str:
+        """One fixed-prompt model call: it processes input, it doesn't decide flow."""
+        reply = await self.llm_chat([{"role": "user", "content": prompt}], system=system)
+        return reply.text
+
+    async def llm_chat(
+        self,
+        messages: list[dict],
+        *,
+        tools: list[dict] | None = None,
+        system: str | None = None,
+        on_delta: Any = None,
+    ):
+        """Make one chat call through the model port and meter it uniformly
+        (returns the normalized LlmReply).
+
+        on_delta is passed through to the implementation for token streaming;
+        metering and normalization still happen here.
+        """
+        if self._llm is None:
+            raise RuntimeError("no LlmPort injected; cannot call the model")
+        reply = await self._llm.chat(messages, tools=tools, system=system, on_delta=on_delta)
+        self.run.metrics["llm_calls"] += 1
+        self.run.metrics["tokens"] += reply.tokens
+        return reply
+
+    async def call_tool(self, name: str, arguments: dict | None = None) -> Any:
+        """Make one governed call through the tool port, returning a ToolResult."""
+        if self._tools is None:
+            raise RuntimeError("no ToolPort injected; cannot call a tool")
+        self.run.metrics["tool_calls"] += 1
+        # unique per call (the Run's counter); not retry/park-stable — see ToolCall
+        count = self.run.metrics["tool_calls"]
+        call = ToolCall(name, arguments or {}, call_id=f"{self.run_id}:{self.node_id}:{count}")
+        return await self._tools.dispatch(call, ctx=self)
+
+    async def spawn(
+        self,
+        spec: Any,
+        task: str,
+        *,
+        input: dict | None = None,
+        llm: Any = None,
+        tools: Any = None,
+    ) -> dict:
+        """Activate a child Run (call semantics: it returns its result when done).
+
+        ``input`` is the child's opening state update — the ReAct layer builds it
+        from the task (an opening user message); the kernel never derives it.
+        ``llm``/``tools`` bind that child to its own Agent identity. Either way
+        the ledger (event log / stores) is the host scheduler's — one Run tree.
+        """
+        if self._subagent is None:
+            raise RuntimeError("no SubagentPort injected; cannot activate a sub-agent")
+        return await self._subagent.activate(
+            spec, task, self.run, self.node_id, input=input, llm=llm, tools=tools
+        )
+
+    async def save_artifact(
+        self,
+        filename: str,
+        data: Any,
+        *,
+        mime: str = "",
+        title: str = "",
+    ) -> dict[str, Any]:
+        """Persist a versioned file produced by this run.
+
+        The bytes go to the BlobStore; only a pointer fact is appended to the
+        event log, so the artifact library and its version history survive a
+        replay without bloating the stream. ``data`` may be str/bytes/dict/list.
+        Returns the pointer (filename/version/uri/mime/size).
+        """
+        if self._blobs is None:
+            raise RuntimeError("no BlobStore injected; cannot save an artifact")
+        if self._record is None:
+            raise RuntimeError("no event recorder injected; cannot record an artifact fact")
+        pointer = await self._blobs.save(self.run_id, filename, data, mime)
+        fact = dict(pointer)
+        if title:
+            fact["title"] = title
+        await self._record(ARTIFACT_WRITTEN, fact)
+        return pointer
+
+    async def load_artifact(self, filename: str, version: int | None = None) -> bytes:
+        """Read back what save_artifact wrote — the twin of the write path,
+        composed from the same injected pieces: the pointer folds from this
+        run's recorded facts (the stream is the only index; ``version=None``
+        means latest), then the bytes come from the BlobStore. Reading writes
+        no fact and changes no state, so replay never depends on it. A save
+        fact commits when it is made — unlike state_delta, which folds at the
+        barrier — so a same-wave sibling may not see it yet: chain writer and
+        reader with an edge when the read is meant. Scope is this run's own
+        artifacts — cross-run reads would need a Run-tree law, deliberately
+        not smuggled in here."""
+        if self._blobs is None:
+            raise RuntimeError("no BlobStore injected; cannot load an artifact")
+        if self._facts is None:
+            raise RuntimeError("no ledger reader injected; cannot load an artifact")
+        pointer = resolve_artifact(await self._facts(), filename, version)
+        return await self._blobs.load(pointer["uri"])
+
+
+# ════════════ Child-Run verdict (one table for every delegation surface) ════════════
+
+
+@dataclass(frozen=True)
+class ChildVerdict:
+    """The activation result reduced to one of three terminal verdicts.
+
+    - state=SUSPENDED: the child parked; ``question`` must be lifted to the caller;
+    - state=FAILED: the child failed; ``error`` must hard-fail the caller;
+    - state=COMPLETED: ``output`` is the value to carry back.
+    """
+
+    run_id: str
+    state: RunState
+    output: Any = None
+    question: str = ""
+    error: str = ""
+
+
+def classify_child_result(result: dict) -> ChildVerdict:
+    """Normalize an activation result dict into a ChildVerdict.
+
+    This is the single decision table behind all three delegation surfaces —
+    the kernel's SubPlanBody (renders it as an Outcome), and the runtime's
+    delegate_to / spawn_agent (render it across the tool boundary). Each layer
+    only chooses how to *present* the verdict; the suspended/failed/done
+    branching lives here once, so the surfaces cannot drift apart.
+    """
+    state = result.get("state")
+    run_id = result["run_id"]  # a missing id is a broken activator: fail here, not far away
+    if state == RunState.SUSPENDED:
+        return ChildVerdict(run_id, RunState.SUSPENDED, question=result.get("question", ""))
+    if state == RunState.FAILED:
+        return ChildVerdict(
+            run_id,
+            RunState.FAILED,
+            error=str(result.get("error") or result.get("output") or ""),
+        )
+    return ChildVerdict(run_id, RunState.COMPLETED, output=result.get("output"))
+
+
+# ════════════ Four built-in bodies ════════════
+
+
+class FnBody:
+    """L0: a Python function (plain or async).
+
+    The function may be written as f(x) taking only input, or f(x, ctx) to use
+    services; the kernel adapts by the number of parameters.
+    """
+
+    def __init__(self, fn: Any):
+        self.fn = fn
+        self._params = len(inspect.signature(fn).parameters)
+
+    async def run(self, input: Any, ctx: NodeContext) -> Outcome:
+        args = (input, ctx) if self._params >= 2 else (input,)
+        result = self.fn(*args)
+        if inspect.isawaitable(result):
+            result = await result
+        return coerce_outcome(result)
+
+
+class ToolBody:
+    """L1: make one governed tool call by name; input is the arguments."""
+
+    def __init__(self, tool_name: str):
+        self.tool_name = tool_name
+
+    async def run(self, input: Any, ctx: NodeContext) -> Outcome:
+        result = await ctx.call_tool(self.tool_name, input if isinstance(input, dict) else {})
+        # Tool success/failure comes back as value; the upstream/model decides the
+        # next step rather than the engine dying on a raise.
+        return Outcome.ok(result)
+
+
+class LLMBody:
+    """L2: one fixed-prompt model call. prompt may be a string or an
+    input->str function."""
+
+    def __init__(self, prompt: Any, system: str | None = None):
+        self.prompt = prompt
+        self.system = system
+
+    async def run(self, input: Any, ctx: NodeContext) -> Outcome:
+        text = self.prompt if isinstance(self.prompt, str) else self.prompt(input)
+        answer = await ctx.llm_complete(text, system=self.system)
+        return Outcome.ok(answer)
+
+
+class SubPlanBody:
+    """L3: activate a sub-plan/sub-agent, run it recursively with the same
+    kernel, and fold its terminal state."""
+
+    def __init__(self, spec: Any, *, llm: Any = None, tools: Any = None, seed: Any = None):
+        # spec is the child Plan; llm/tools optionally bind it to its own Agent
+        # identity (a Workflow node that is a self-contained Agent).
+        self.spec = spec
+        self.llm = llm
+        self.tools = tools
+        # seed(task) maps the node's task to the child Plan's opening state
+        # update (ReAct passes its opening-message builder). None -> the child
+        # starts from the raw task. It is node wiring, not a Plan method, so
+        # replay (which folds the already-logged STATE_DELTA) needs no case here.
+        self.seed = seed
+
+    async def run(self, input: Any, ctx: NodeContext) -> Outcome:
+        if ctx.resume_value is not None:
+            # two-step resume: the child was resumed separately and its output
+            # arrived as this node's resume value; re-spawning here would orphan
+            # the child that already did the work. (A child that legitimately
+            # completes with None output needs a sentinel value from the
+            # operator: None is indistinguishable from "not resumed".)
+            return Outcome.ok(ctx.resume_value)
+        task = str(input or "")
+        result = await ctx.spawn(
+            self.spec,
+            task,
+            input=self.seed(task) if self.seed else None,
+            llm=self.llm,
+            tools=self.tools,
+        )
+        # One shared decision table; this kernel surface renders it as an Outcome.
+        verdict = classify_child_result(result)
+        if verdict.state == RunState.SUSPENDED:
+            # a parked child parks the caller too: the question travels up and
+            # the payload carries the child's run_id so resume can find it
+            return Outcome.park(
+                "delegation",
+                payload={"child_run_id": verdict.run_id, "task": task},
+                question=verdict.question,
+            )
+        if verdict.state == RunState.FAILED:
+            # call semantics: a failed child Run fails this node — it is never
+            # folded as a value (the runtime raises HardToolError for the same fact).
+            raise RuntimeError(verdict.error)
+        # Call semantics: by default return only the child Run's final output; a
+        # custom body can pull the full result.
+        return Outcome.ok(verdict.output)

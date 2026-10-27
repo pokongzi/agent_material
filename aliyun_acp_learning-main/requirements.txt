@@ -1,0 +1,52 @@
+# LlamaIndex 生态（v0.14 兼容版本；openai-like 组件不再默认约束 transformers<5）
+llama-index-core==0.14.23
+llama-index-vector-stores-faiss==0.6.0
+llama-index-embeddings-dashscope==0.5.0
+llama-index-readers-file==0.6.0
+llama-index-llms-dashscope==0.6.1
+llama-index-readers-dashscope==0.5.0
+llama-index-llms-openai-like==0.7.2
+llama-index-embeddings-openai-like==0.3.1
+
+# LangChain 生态（已全部升级）
+langchain==0.3.27
+langchain-core==0.3.80
+langchain-community==0.3.31
+langchain-openai==0.3.35
+langchain-text-splitters==0.3.11
+
+# Web 与 API 框架
+gradio==5.50.0
+gradio-client==1.14.0
+fastapi==0.136.3
+uvicorn==0.49.0
+pydantic==2.12.3
+prometheus-fastapi-instrumentator==7.1.0
+
+# 数据科学、评估与底层库
+numpy==2.2.6
+faiss-cpu==1.13.0
+dashscope==1.22.2
+docx2txt==0.9
+openpyxl==3.1.5
+matplotlib==3.10.7
+pandas==2.2.3
+seaborn==0.13.2
+ragas==0.1.9
+httpx==0.28.1
+openai==2.45.0
+
+# 阿里云与其他框架
+alibabacloud_green20220302==2.21.2
+oss2==2.19.0
+lagent==0.1.2
+mmengine==0.10.3
+modelscope==1.38.0
+agentscope==1.0.18
+mcp<2.0  # agentscope 1.x 依赖旧 streamablehttp_client 名称，mcp v2 已重命名
+mem0ai<2.0  # agentscope 1.x 使用旧版 search() API，mem0 v2 改为 filters 传参
+ipywidgets==8.1.7
+nbconvert==7.17.1
+pymupdf4llm==0.2.6
+alibabacloud_bailian20231229==1.8.2
+simplejson==3.19.3
