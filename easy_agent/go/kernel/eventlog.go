@@ -5,15 +5,15 @@ import (
 	"time"
 )
 
-// eventlog —— Event 是事实源；state 是从 Event 流折叠出的投影。
+// eventlog —— Event 是事实源；state 不单独存，而是把 Event 流从头逐条累加算出来的结果。
 //
 // 三部分：
 //   - Event：不可变的"已发生的事实"，只追加、永不修改；
-//   - ApplyEvent：把单个 Event 折叠进 shared state 的纯函数；
+//   - ApplyEvent：把单个 Event 累加进 shared state 的纯函数；
 //   - EventLog 存储接口加进程内默认实现。
 //
 // 刻意不提供快照存储：仅凭事件流即可重建每个 Run（见 replay）。
-// 从 Event 折叠 state，同时得到审计、时间旅行与崩溃恢复。
+// 由 Event 逐条累加出 state，同时得到审计、时间旅行与崩溃恢复。
 
 // Event 种类（教学版只保留最有代表性的）。
 const (

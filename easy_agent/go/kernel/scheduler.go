@@ -171,8 +171,24 @@ func sameKeySet(m map[string]any, keys []string) bool {
 	return true
 }
 
-// —— 引擎主循环 ——
-
+// drive —— 引擎主循环：真正把一张图跑起来的地方。
+//
+// 一句话：反复做"算出这一批该跑哪些节点 → 让它们并发跑 → 在屏障处统一结算"，
+// 直到没有节点可跑、被挂起（park）、或失败为止。每一"批"就是一个"波"。
+//
+// 完整流程：
+//
+//	① 首次进入：绑定模型/工具端口，写下 run_started 与开场状态（seed）两条事实；
+//	② 主循环，只要 Run 还在 running：
+//	   1) 算就绪：nextReady 找出本波可跑的节点，以及被结构性跳过的死分支；
+//	   2) 波内并发：先单线程解析输入并写 node_started（保证事件流顺序确定），
+//	      再把各节点的 body 丢到 goroutine 上并发执行；
+//	   3) 屏障结算：等全部跑完，把结果按 失败 / 挂起 / 成功 分类，
+//	      用 reducer 折叠状态增量，逐个写成事实；
+//	   4) 收尾：处理挂起、失败、控制命令（Goto/Send），决定继续下一波还是退出。
+//
+// 关键纪律：body 并发执行时绝不直接改共享状态，所有变更都留到屏障处、
+// 经由唯一的 commit → run.Apply 落地，因此同样的事件流必然得到同样的结果。
 func (s *Scheduler) drive(plan *Plan, run *Run) error {
 	// 引擎入口是唯一解析身份端口（DIP）的地方：显式绑定予以保留（子 Run 或
 	// 恢复的 Run 上 Agent 自己的 model/registry）；未绑定的 Run 继承 Scheduler
@@ -212,6 +228,7 @@ func (s *Scheduler) drive(plan *Plan, run *Run) error {
 	}
 
 	for run.Running() {
+		// 1) 算就绪：找出本波能跑的节点（ready）和被跳过的死分支（swept）
 		ready, swept := s.nextReady(plan, run)
 		for _, key := range swept { // 每个被结构性跳过的分支都是一条 fact
 			if err := s.commit(run, EvNodeSkipped, map[string]any{"node": key}); err != nil {

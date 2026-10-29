@@ -24,17 +24,13 @@ type Command interface {
 	isCommand()
 }
 
-// Goto 重新 re-arm Target（移回 PENDING），使其可再次运行。
+// Goto 让 Target 重新可运行（移回 PENDING）。
 //
-// 重新 re-arm 后何时就绪有两种模式，由 Immediate 选择：
-//   - Immediate=true（默认）：同时加入 release 列表，使下一波
-//     绕过前驱立即就绪。用于
-//     顺序回边（ReAct 循环）与运行时跳转。
-//   - Immediate=false：只 re-arm；就绪仍由入边
-//     与 join 决定。用于迭代收敛点（多轮黑板）。
+// Immediate 决定它何时就绪：
+//   - true（默认）：立即 release，下一波绕过前驱直接运行——用于回边循环（ReAct）与运行时跳转。
+//   - false：仅 re-arm，就绪仍由入边与 join 决定——用于迭代收敛点（多轮黑板）。
 //
-// Payload 是本次转换交给目标的输入，与 Send.Payload 对称
-// （多 agent 交接用它携带摘要）。
+// Payload 是交给目标的下次输入（多 agent 交接时携带摘要），语义与 Send.Payload 对称。
 type Goto struct {
 	Target    string
 	Immediate bool
