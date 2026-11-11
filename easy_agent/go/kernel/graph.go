@@ -160,35 +160,57 @@ func (p *Plan) EnsureChannel(name string, ch Channel) {
 
 // Validate 是编译期体检：悬空边、未知入口、非法 join 策略都在此失败，
 // 而不是运行中途。检查顺序与 Python 原版一致（先边、再入口、后 join）。
+//
+// 四段检查：
+//
+//	① 悬空边：outgoing 里的每个 source 和它各条 edge 的 target 都必须在 nodes 中存在；
+//	② 入口存在：Entry 里写的 id 必须是已注册的节点；
+//	③ Join 策略合法：每个节点的 Join 得能过 valid()（如 Quorum(n) 中 1≤n≤入度 等约束）；
+//	④ 自动入口兜底：若以上都通过但 Entry 仍为空，把所有"没入边"的节点当起点写入。
+//
+// 设计注意：
+//   - 采用"第一个发现错就返回"的 fail-fast，一次报一条 —— 方便修。
+//   - ⚠ ④ 兜底段会**就地修改 p.Entry**（append）—— Validate 不是纯函数；
+//     多次调用安全（第二次 len(p.Entry)>0 则不再重兜底），但需注意并发：
+//     调用方应在 StartRun 前串行跑一次，不应当作 hot-path 重复调用。
 func (p *Plan) Validate() error {
-	// 边的源和目标都必须存在。outgoing 键按排序顺序迭代，报错因此确定。
+	// ① 悬空边。边的源和目标都必须存在。
+	// outgoing 是 map[string][]Edge；Go map 遍历乱序 → 先取键到 slice、排序后再遍历，
+	// 这样同构的两张残缺图产出的错误信息完全一致（确定化），方便快照比对与测试断言。
 	srcKeys := make([]string, 0, len(p.outgoing))
 	for src := range p.outgoing {
 		srcKeys = append(srcKeys, src)
 	}
 	sort.Strings(srcKeys)
 	for _, src := range srcKeys {
+		// 先验源：一个不存在的源名很可能是拼写错误或 Add/Edge 顺序写反。
 		if _, ok := p.nodes[src]; !ok {
 			return fmt.Errorf("edge source %q does not exist", src)
 		}
+		// 再逐条验目标：同一源可能开多条出边，按声明顺序报第一条坏的 target。
 		for _, e := range p.outgoing[src] {
 			if _, ok := p.nodes[e.Target]; !ok {
 				return fmt.Errorf("edge %s->%s target does not exist", src, e.Target)
 			}
 		}
 	}
+	// ② 入口存在。引用了不存在的节点名时直接失败 —— 不自动剥掉，避免默默丢起点。
 	for _, en := range p.Entry {
 		if _, ok := p.nodes[en]; !ok {
 			return fmt.Errorf("entry node %q does not exist", en)
 		}
 	}
+	// ③ Join 策略合法。按 nodeOrder 遍历保报错顺序确定。
+	// valid() 失败典型情形：Quorum(n) 中 n<=0；或未知 JoinMode。
 	for _, id := range p.nodeOrder {
 		if !p.nodes[id].Join.valid() {
 			return fmt.Errorf("node %q has invalid join policy", id)
 		}
 	}
+	// ④ 自动入口兜底：没声明 Entry 时，把所有"没入边"的节点当起点。
+	// 方便单节点图 / 简单扇形图不写 Entry 也能直接跑；一旦写了 Entry，
+	// 就切换到"显式入口"语义 —— 孤立节点不再自动启动（见 Ready 里的同一条纪律）。
 	if len(p.Entry) == 0 {
-		// 无显式入口时，把没有入边的节点当作入口。
 		for _, id := range p.nodeOrder {
 			if len(p.incoming[id]) == 0 {
 				p.Entry = append(p.Entry, id)
@@ -249,7 +271,6 @@ func (p *Plan) TerminalIDs() []string {
 }
 
 // —— 键集合：静态（非模板）节点 + 全部 fan-out 实例 ——
-
 func (p *Plan) staticKeys() []string {
 	out := make([]string, 0, len(p.nodeOrder))
 	for _, id := range p.nodeOrder {
@@ -318,26 +339,46 @@ func (p *Plan) predecessorTerminal(run *Run, source string, emptyFanout bool, sk
 // 条件边"此刻不存活"但其前驱尚未到终态时，只等待 —— 不提前判死（前驱下一波
 // 可能改变状态；这正是 ReAct 回边）。真正的死分支由 SweepSkipped 在全图停滞后
 // 清理。
+//
+// 算法五段式（对每个 pending key 依次判定）：
+//
+//	① 动态实例直通：Send 拷出来的，pending 即开跑；
+//	② 起点优先：显式 Entry 或被 Goto Activated 的节点，不看前驱；
+//	③ 前驱终态门：任一前驱未达终态 → 再等一波（避免过早放行）；
+//	④ 存活边筛选：看条件边 When(shared) 现在是否开着；全不活留给 SweepSkipped；
+//	⑤ Join 汇合：按节点自己的 all/any/quorum 策略判 done/total 是否满足。
+//
+// 参数 emptyFanout：前驱是模板但实例为空时，是否当作"已终态"——由 nextReady
+// 两阶段调用（先 false 严格等、后 true 宽松放行）驱动，见 scheduler.go。
 func (p *Plan) Ready(run *Run, emptyFanout bool) []string {
 	var ready []string
+	// allKeys = staticKeys + 全部 fan-out 实例；覆盖"能被执行的 key"全集。
 	for _, key := range p.allKeys(run) {
+		// 只处理 pending：running/completed/skipped/failed 都已经或即将由屏障推进。
 		if !run.IsPending(key) {
 			continue
 		}
-		if run.IsInstance(key) { // Send 的拷贝：pending 即可运行
+		// ① Send 拷出的动态实例：带 # 后缀，由发送方 Send 命令直接激活，
+		// 不需要走图上入边判定（它的"前驱"事实上就是 Send 动作本身）。
+		if run.IsInstance(key) {
 			ready = append(ready, key)
 			continue
 		}
 		preds := p.incoming[key]
-		// 起点：显式入口，或被 Goto 显式激活的节点。
+		// ② 起点：显式入口，或被 Goto 显式激活的节点（GotoRejoin/back-edge 走这条）。
+		// 这两类无视前驱状态立即放行；Activated 是一次性的，run 里会被消费掉。
 		if containsStr(p.Entry, key) || run.Activated[key] {
 			ready = append(ready, key)
 			continue
 		}
+		// 有显式入口时，孤立节点（无入边 + 不在 Entry）不自动启动 ——
+		// 免得图上少接一条边就被静默执行；宁可卡住让作者察觉。
 		if len(preds) == 0 {
-			// 有显式入口时，孤立节点不自动启动。
 			continue
 		}
+		// ③ 前驱终态门：任一前驱"还没到任一终态"就把这个 key 挡回来。
+		// 这里用 predecessorTerminal（done/skipped/failed 都算终态），不是 done ——
+		// 因为"失败的模板实例"也应让下游有机会看到（fail-fast 会另行终止整个 Run）。
 		hasOpenPred := false
 		for _, e := range preds {
 			if !p.predecessorTerminal(run, e.Source, emptyFanout, nil) {
@@ -348,6 +389,8 @@ func (p *Plan) Ready(run *Run, emptyFanout bool) []string {
 		if hasOpenPred {
 			continue // 前驱仍在运行，再等一波
 		}
+		// ④ 存活边筛选：条件边 e.When(shared) 此刻是否开着。
+		// edgeLive 只在 When 为 nil（无条件边）或 When(shared) 返 true 时计为存活。
 		var liveEdges []Edge
 		for _, e := range preds {
 			if edgeLive(e, run.Shared) {
@@ -355,8 +398,13 @@ func (p *Plan) Ready(run *Run, emptyFanout bool) []string {
 			}
 		}
 		if len(liveEdges) == 0 {
-			continue // 无存活边；图停滞后由 SweepSkipped 清理
+			// 所有前驱已到终态、但没有一条边存活 —— 不在此处直接判死，
+			// 交给下一轮 nextReady 中的 SweepSkipped 在全图停滞后发 EvNodeSkipped。
+			// 这样给"前驱在 ReAct 回边里还可能重跑"留了机会。
+			continue
 		}
+		// ⑤ Join 汇合：数存活边里已完成 (done) 的个数，交给节点的汇合策略判是否满足。
+		// predecessorDone 对静态节点 = IsCompleted || skipped；对模板 = predecessorTerminal（同上）。
 		done := 0
 		for _, e := range liveEdges {
 			if p.predecessorDone(run, e.Source, emptyFanout, nil) {
@@ -364,8 +412,9 @@ func (p *Plan) Ready(run *Run, emptyFanout bool) []string {
 			}
 		}
 		if done == 0 {
-			continue
+			continue // 一个都没完成，等下一波
 		}
+		// Join.satisfied 实现 All / Any / Quorum(n) 三种策略（见 types.go）。
 		if !p.nodes[key].Join.satisfied(done, len(liveEdges)) {
 			continue
 		}
@@ -376,7 +425,7 @@ func (p *Plan) Ready(run *Run, emptyFanout bool) []string {
 
 // SweepSkipped 是死分支清理：前驱全部到终态、却没有存活边的 pending 静态节点，
 // 级联至不动点。只在"本波无节点就绪"时调用，故不会误杀稍后可能被激活的分支。
-// 纯函数：按序返回键，不触碰 Run。
+// 无副作用：只计算不落账，按序返回键，不触碰 Run，node_skipped fact 由调用方提交。
 func (p *Plan) SweepSkipped(run *Run) []string {
 	var swept []string
 	skipped := map[string]bool{}
@@ -425,6 +474,7 @@ func (p *Plan) IsDone(run *Run) bool {
 	return true
 }
 
+// containsStr 列表是否包含某字符串。
 func containsStr(list []string, s string) bool {
 	for _, x := range list {
 		if x == s {

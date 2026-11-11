@@ -32,9 +32,9 @@ type Checker func(data map[string]any) (BlockingResult, error)
 
 // Subscription 是带背压策略的有界事件订阅。
 type Subscription struct {
-	kinds   []string
+	kinds   []string //事件名白名单
 	maxsize int
-	onFull  string
+	onFull  string // "block" or "drop"
 
 	mu      sync.Mutex
 	cond    *sync.Cond

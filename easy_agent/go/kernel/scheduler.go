@@ -205,6 +205,7 @@ func (s *Scheduler) drive(plan *Plan, run *Run) error {
 	if run.EventSeq == 0 && run.State == RunRunning {
 		// 由账本 fact 决定账本 fact：event_seq == 0 表示该事件流尚未开启。
 		// depth 搭载在 fact 上，跨进程 resume 仍保有树形深度熔断。
+		fmt.Println("committing run_started")
 		if err := s.commit(run, EvRunStarted, map[string]any{
 			"task": run.Task, "name": run.Name(), "depth": run.Depth,
 		}); err != nil {
@@ -227,7 +228,10 @@ func (s *Scheduler) drive(plan *Plan, run *Run) error {
 		}
 	}
 
+	fmt.Println("nextReady")
+
 	for run.Running() {
+		fmt.Println("nextReady", run.EventSeq)
 		// 1) 算就绪：找出本波能跑的节点（ready）和被跳过的死分支（swept）
 		ready, swept := s.nextReady(plan, run)
 		for _, key := range swept { // 每个被结构性跳过的分支都是一条 fact
@@ -295,7 +299,7 @@ func (s *Scheduler) drive(plan *Plan, run *Run) error {
 				it := *res.outcome.Suspend
 				it.NodeID = res.key
 				parked[res.key] = &it
-				// park 保留其 Goto 输入供重跑
+				// // Park 不删 Deliveries：Goto 输入刻意保留，供 Resume 重跑时复用（仅在 completed/failed 时由 Apply 清除）
 			default:
 				for k, v := range res.outcome.StateDelta {
 					if err := writes.Buffer(k, v, res.key); err != nil {
@@ -351,8 +355,8 @@ func (s *Scheduler) drive(plan *Plan, run *Run) error {
 	return nil
 }
 
-// nextReady 报告当前可运行的节点，以及新被扫为死分支的节点。清扫是纯的：
-// 其标记只在调用方提交 node_skipped fact 时落地，故放行 join 的 skip 在下一轮
+// nextReady 报告当前可运行的节点，以及新被扫为死分支的节点。清扫是无副作用的
+// （只计算不落账，node_skipped fact 由调用方提交），故放行 join 的 skip 在下一轮
 // 循环才显现。空 fan-out 最后收敛。
 func (s *Scheduler) nextReady(plan *Plan, run *Run) (ready []string, swept []string) {
 	ready = plan.Ready(run, false)
@@ -481,13 +485,16 @@ func (s *Scheduler) runOnce(node *Node, value any, ctx *NodeContext) (Outcome, e
 // nodeInput 解析本波交给节点的输入：Send 载荷、Goto 投递、Run 任务（源节点），
 // 或聚合的上游输出。
 func (s *Scheduler) nodeInput(plan *Plan, run *Run, key string) any {
+	// 首选实例输入
 	if run.IsInstance(key) {
 		return run.InputOf(key)
 	}
+	// 然后 Goto 投递
 	if v, ok := run.Deliveries[key]; ok {
 		// Goto 迁移携带的输入：此处读取，节点到终态时消费 —— park 时保留供重跑。
 		return v
 	}
+	// 然后聚合上游输出
 	preds := plan.Incoming(key)
 	if len(preds) == 0 {
 		return run.Task
@@ -651,6 +658,7 @@ func (s *Scheduler) commit(run *Run, kind string, data map[string]any) error {
 	if data == nil {
 		data = map[string]any{}
 	}
+
 	ev := NewEvent(run.EventSeq+1, run.RunID, kind, data, run.ParentID)
 	if err := s.eventlog.Append(ev); err != nil {
 		return err
@@ -658,6 +666,7 @@ func (s *Scheduler) commit(run *Run, kind string, data map[string]any) error {
 	if err := run.Apply(ev); err != nil {
 		return err
 	}
+	fmt.Println("commit-applied:", ev.Data, " ", ev.Kind)
 	s.bus.Fire(kind, map[string]any{"evt": ev})
 	return nil
 }

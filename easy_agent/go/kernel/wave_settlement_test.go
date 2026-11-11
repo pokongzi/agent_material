@@ -40,6 +40,10 @@ func chainPlan(depth int) *Plan {
 	return p
 }
 
+// TestDeepDelegationNeverWaitsOnItself 覆盖场景：深度嵌套的子 Agent 委派链
+// （chainPlan(3)，每层 Spawn 下一层）在 concurrency=1（全局仅一个并发槽位）下仍能跑完，
+// 不会自我死锁——因为每个 Run 用独立的信号量池，父级不会占着唯一槽位等子级。
+// 断言：5 秒内返回、终态 RunCompleted、最终输出为叶子的 "done"；超时即判死锁失败。
 func TestDeepDelegationNeverWaitsOnItself(t *testing.T) {
 	sch := NewScheduler(SchedulerOptions{Concurrency: 1})
 	type runRes struct {
@@ -67,8 +71,11 @@ func TestDeepDelegationNeverWaitsOnItself(t *testing.T) {
 	}
 }
 
+// TestAFailedWaveStillSettlesItsSiblings 覆盖场景：波是失败的一致性边界——fail-fast 只停 Run、
+// 不停本波结算。同一波里 boom 节点失败、ok 兄弟节点成功时，成功部分照常折叠并落账。
+// 断言：Run 终态 RunFailed；ok 的 delta 折叠进 Shared["kept"]="yes"；事件流含 NODE_COMPLETED
+// 与 STATE_DELTA；且 NODE_FAILED 排在 RUN_FAILED 之前（先记节点失败，再判 Run 失败）。
 func TestAFailedWaveStillSettlesItsSiblings(t *testing.T) {
-	// fail-fast 只停 Run 不停结算：成功的兄弟 Node 保留折叠结果与 NODE_COMPLETED，失败节点记 NODE_FAILED。
 	p := NewPlan("", map[string]Channel{"kept": Last(nil)})
 	p.Add(
 		&Node{ID: "boom", Terminal: true, Body: NewFnBody(func(x any, ctx *NodeContext) (any, error) {
@@ -101,8 +108,11 @@ func TestAFailedWaveStillSettlesItsSiblings(t *testing.T) {
 	}
 }
 
+// TestFailureWinsOverASameWaveParkButTheAskIsLogged 覆盖场景：同一波里 ask 节点 park、boom 兄弟
+// 节点失败时，失败优先——Run 判失败而非挂起；但 park 的提问作为"已发生的事实"仍须落账。
+// 断言：Run 终态 RunFailed；INTERRUPTED 排在 RUN_FAILED 之前且携带 question="approve?"；
+// RUN_FAILED 是事件流最后一条；此后 Resume 必失败（终态是历史，不可恢复）。
 func TestFailureWinsOverASameWaveParkButTheAskIsLogged(t *testing.T) {
-	// 同一波中一个 Node park、兄弟 Node 失败时 Run 判失败，但 park 的提问仍是事件流必须承载的事实。
 	p := NewPlan("", nil)
 	p.Add(
 		&Node{ID: "ask", Terminal: true, Body: NewFnBody(func(x any, ctx *NodeContext) (any, error) {
@@ -147,8 +157,11 @@ func TestFailureWinsOverASameWaveParkButTheAskIsLogged(t *testing.T) {
 	}
 }
 
+// TestAGotoPayloadSurvivesAPark 覆盖场景：Goto 携带的输入（Deliveries）由节点终态消费、而非读取即消费，
+// 因此 park 的节点在 resume 后仍以同一份输入重跑（对应 scheduler.go "park 保留其 Goto 输入供重跑"）。
+// 断言：首跑 worker 收到 "hand-off brief" 后 park（RunSuspended）；Resume 后 worker 以同样的
+// "hand-off brief" 再跑一次并完成（RunCompleted），inputs 记录到两次且都为该 payload。
 func TestAGotoPayloadSurvivesAPark(t *testing.T) {
-	// Goto 携带的输入由 Node 的终态消费，而非靠读取消费：park 的 Node 在 resume 后以同一输入重跑。
 	var mu sync.Mutex
 	var inputs []any
 
@@ -199,9 +212,11 @@ func TestAGotoPayloadSurvivesAPark(t *testing.T) {
 	}
 }
 
+// TestTerminalStatesCloseTheStream 覆盖场景：终态持久——Run 结束后其结局是日志里不可变的事实，
+// 事件流以终态事实收尾，不会有任何东西停留在 RUNNING。表驱动覆盖成功与失败两种收场。
+// 断言：ok body → RunCompleted 且最后一条事件为 RUN_COMPLETED；
+// boom body → RunFailed 且最后一条事件为 RUN_FAILED。
 func TestTerminalStatesCloseTheStream(t *testing.T) {
-	// 已结束 Run 的 Outcome 是日志里的事实——唯一持久之物。
-	// 结束后不会有任何东西还停留在 RUNNING。
 	okBody := NewFnBody(func(x any, ctx *NodeContext) (any, error) { return "fine", nil })
 	boomBody := NewFnBody(func(x any, ctx *NodeContext) (any, error) { return nil, fmt.Errorf("boom") })
 	cases := []struct {

@@ -72,7 +72,7 @@ type Run struct {
 	// 绝非事实。账本属于驱动它的 Scheduler。
 	Llm   LlmPort
 	Tools ToolPort
-	Seed  map[string]any
+	Seed  map[string]any // 初始状态更新
 
 	EventSeq int
 
@@ -253,7 +253,9 @@ func (r *Run) MarkCompleted(key string, output any) {
 }
 
 // MarkSkipped 结构性跳过节点。
-func (r *Run) MarkSkipped(key string) { r.NodeStates[key].Status = NodeSkipped }
+func (r *Run) MarkSkipped(key string) {
+	r.NodeStates[key].Status = NodeSkipped
+}
 
 // MarkFailed 记录节点失败。
 func (r *Run) MarkFailed(key string, errMsg string) {
@@ -355,6 +357,7 @@ func (r *Run) Apply(ev Event) error {
 		}
 	case EvNodeStarted:
 		node := dataStr(d, "node")
+		fmt.Println("node_started:", node)
 		if err := r.requireNode(node); err != nil {
 			return err
 		}
