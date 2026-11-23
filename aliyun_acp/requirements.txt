@@ -48,5 +48,6 @@ mem0ai<2.0  # agentscope 1.x 使用旧版 search() API，mem0 v2 改为 filters 
 ipywidgets==8.1.7
 nbconvert==7.17.1
 pymupdf4llm==0.2.6
+pymupdf==1.28.2  # 2.x 没有 macOS x86_64 预编译包，pip 会改去源码编译 MuPDF
 alibabacloud_bailian20231229==1.8.2
 simplejson==3.19.3
